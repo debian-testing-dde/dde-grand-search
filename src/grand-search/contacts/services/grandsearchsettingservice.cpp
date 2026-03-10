@@ -54,10 +54,12 @@ void GrandSearchSettingService::Show()
     }
 
     d_p->timer->stop();
-    QProcess process;
     qCDebug(logGrandSearch) << "Starting settings process: dde-grand-search --setting";
-    process.start("dde-grand-search", QStringList()<<"--setting");
-    process.waitForFinished(-1);
+    if (!QProcess::startDetached("dde-grand-search", QStringList() << "--setting")) {
+        qCWarning(logGrandSearch) << "Failed to start settings process: dde-grand-search --setting";
+        qApp->exit(1);
+        return;
+    }
+
     qApp->exit(0);
-    _Exit(0);
 }

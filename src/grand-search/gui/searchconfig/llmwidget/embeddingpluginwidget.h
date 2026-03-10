@@ -10,6 +10,8 @@
 #include <DLabel>
 #include <DWidget>
 
+class QProcess;
+
 namespace GrandSearch {
 class EmbeddingPluginWidget : public Dtk::Widget::DWidget
 {
@@ -25,6 +27,7 @@ protected:
     void paintEvent(QPaintEvent* e) Q_DECL_OVERRIDE;
 private:
     void initUI();
+    void updateInstallStatus(bool installed);
 signals:
     void pluginStateChanged(bool);
 
@@ -33,6 +36,7 @@ private:
     Dtk::Widget::DLabel *m_pLabelSummary = nullptr;
     Dtk::Widget::DLabel *m_pLabelStatus = nullptr;
     ModelManageButton *m_pManageModel = nullptr;
+    QProcess *m_statusProcess = nullptr;
 };
 
 }

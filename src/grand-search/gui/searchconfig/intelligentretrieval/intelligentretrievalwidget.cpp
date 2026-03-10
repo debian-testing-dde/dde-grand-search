@@ -21,12 +21,16 @@
 
 #include <QDBusConnection>
 #include <QDBusMessage>
+#include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusInterface>
+#include <QApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
 #include <QLoggingCategory>
+#include <functional>
+#include <utility>
 
 Q_DECLARE_LOGGING_CATEGORY(logGrandSearch)
 
@@ -36,6 +40,103 @@ DCORE_USE_NAMESPACE
 using namespace GrandSearch;
 
 #define INER_APP_NAME "dde-grand-search"
+
+static QDBusMessage createQueryLangMsg(const QString &method);
+#ifdef VECTOR_SEARCH
+static QDBusMessage createVectorMsg(const QString &method);
+#endif
+
+namespace {
+QVariantHash g_semanticStatusCache;
+bool g_queryLangSupportedCache = false;
+#ifdef VECTOR_SEARCH
+bool g_vectorSupportedCache = false;
+QVariantHash g_vectorStatusCache;
+#endif
+
+template<typename ReplyType, typename Callback>
+void watchPendingReply(const QDBusMessage &msg, int timeout, QObject *context, Callback &&callback)
+{
+    QObject *owner = context ? context : qApp;
+    if (!owner)
+        return;
+
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(msg, timeout), owner);
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, owner, [watcher, callback = std::forward<Callback>(callback)]() mutable {
+        QDBusPendingReply<ReplyType> reply = *watcher;
+        callback(reply);
+        watcher->deleteLater();
+    });
+}
+
+void refreshQueryLangSupported(QObject *context = nullptr, const std::function<void(bool)> &callback = {})
+{
+    watchPendingReply<bool>(createQueryLangMsg("Enable"), 500, context, [callback](const QDBusPendingReply<bool> &reply) {
+        if (reply.isValid()) {
+            g_queryLangSupportedCache = reply.value();
+        } else {
+            qCWarning(logGrandSearch) << "Failed to query AI Smart Search capability - Service: org.deepin.ai.daemon.QueryLang"
+                                      << "Error:" << reply.error().message();
+        }
+
+        if (callback)
+            callback(g_queryLangSupportedCache);
+    });
+}
+
+void refreshSemanticStatus(QObject *context = nullptr, const std::function<void(const QVariantHash &)> &callback = {})
+{
+    watchPendingReply<QString>(createQueryLangMsg("GetSemanticStatus"), 500, context, [callback](const QDBusPendingReply<QString> &reply) {
+        if (reply.isValid()) {
+            g_semanticStatusCache = QJsonDocument::fromJson(reply.value().toUtf8()).object().toVariantHash();
+        } else {
+            qCWarning(logGrandSearch) << "Failed to get semantic status - Service: org.deepin.ai.daemon.QueryLang"
+                                      << "Error:" << reply.error().message();
+        }
+
+        if (callback)
+            callback(g_semanticStatusCache);
+    });
+}
+
+#ifdef VECTOR_SEARCH
+void refreshVectorSupported(QObject *context = nullptr, const std::function<void(bool)> &callback = {})
+{
+    watchPendingReply<bool>(createVectorMsg("Enable"), 500, context, [callback](const QDBusPendingReply<bool> &reply) {
+        if (reply.isValid()) {
+            g_vectorSupportedCache = reply.value();
+        } else {
+            qCWarning(logGrandSearch) << "Failed to query vector search capability - Service: org.deepin.ai.daemon.VectorIndex"
+                                      << "Error:" << reply.error().message();
+        }
+
+        if (callback)
+            callback(g_vectorSupportedCache);
+    });
+}
+
+void refreshVectorStatus(QObject *context = nullptr, const std::function<void(const QVariantHash &)> &callback = {})
+{
+    auto msg = createVectorMsg("getAutoIndexStatus");
+    QVariantList list;
+    list.append(QString(INER_APP_NAME));
+    msg.setArguments(list);
+
+    watchPendingReply<QString>(msg, 500, context, [callback](const QDBusPendingReply<QString> &reply) {
+        if (reply.isValid()) {
+            g_vectorStatusCache = QJsonDocument::fromJson(reply.value().toUtf8()).object().toVariantHash();
+        } else {
+            qCWarning(logGrandSearch) << "Failed to get vector index status - Service: org.deepin.ai.daemon.VectorIndex"
+                                      << "Error:" << reply.error().message();
+        }
+
+        if (callback)
+            callback(g_vectorStatusCache);
+    });
+}
+#endif
+}
+
 static QDBusMessage createQueryLangMsg(const QString &method)
 {
     QDBusMessage msg = QDBusMessage::createMethodCall("org.deepin.ai.daemon.QueryLang", "/org/deepin/ai/daemon/QueryLang",
@@ -212,11 +313,16 @@ void IntelligentRetrievalWidget::updateState()
     // update index status
     if (m_semantic->checked()) {
         this->updateIndexStatusContent(this->getIndexStatus());
+        refreshSemanticStatus(this, [this](const QVariantHash &status) {
+            if (m_semantic && m_semantic->checked())
+                updateIndexStatusContent(status);
+        });
     }
 
     m_embWidget->checkInstallStatus();
 
 #ifdef VECTOR_SEARCH
+    auto cfg = SearchConfig::instance();
     if (isVectorSupported()) {
         bool checked = cfg->getConfig(GRANDSEARCH_SEMANTIC_GROUP, GRANDSEARCH_CLASS_GENERALFILE_SEMANTIC_VECTOR, true).toBool();
         m_vector->checkBox()->setEnabled(true);
@@ -224,8 +330,8 @@ void IntelligentRetrievalWidget::updateState()
         m_vector->setDetail(tr("When enabled, you can search the text of articles using disjointed and incomplete keywords."));
         if (checked) {
             m_enableIndex->setEnabled(true);
-            QVariantHash status;
-            bool autoidx = getIndexStatus(status);
+            QVariantHash status = g_vectorStatusCache;
+            bool autoidx = status.value("enable", false).toBool();
             m_enableIndex->setChecked(autoidx);
 
             // update index status
@@ -235,6 +341,16 @@ void IntelligentRetrievalWidget::updateState()
             } else {
                 m_indexStatus->hide();
             }
+            refreshVectorStatus(this, [this](const QVariantHash &asyncStatus) {
+                const bool autoidx = asyncStatus.value("enable", false).toBool();
+                m_enableIndex->setChecked(autoidx);
+                if (autoidx) {
+                    m_indexStatus->show();
+                    updateStatusContent(asyncStatus);
+                } else {
+                    m_indexStatus->hide();
+                }
+            });
         } else {
             m_enableIndex->setChecked(false);
             m_enableIndex->setEnabled(false);
@@ -263,13 +379,7 @@ void IntelligentRetrievalWidget::openAppStore(const QString &app)
     list.append(QString("searchApp?keyword=%0").arg(app));
     msg.setArguments(list);
 
-    QDBusPendingReply<void> ret = QDBusConnection::sessionBus().asyncCall(msg, 100);
-    ret.waitForFinished();
-    if (ret.error().type() != QDBusError::NoError)
-        qCWarning(logGrandSearch) << "Failed to open application store - Service:" << msg.service()
-                                  << "Error:" << QDBusError::errorString(ret.error().type());
-
-    return;
+    QDBusConnection::sessionBus().asyncCall(msg, 100);
 }
 
 void IntelligentRetrievalWidget::updateStatusContent(const QVariantHash &status)
@@ -296,19 +406,15 @@ void IntelligentRetrievalWidget::updateStatusContent(const QVariantHash &status)
 
 bool IntelligentRetrievalWidget::isQueryLangSupported()
 {
-    auto msg = createQueryLangMsg("Enable");
-    QDBusPendingReply<bool> ret = QDBusConnection::sessionBus().asyncCall(msg, 500);
-    ret.waitForFinished();
-    return ret.isValid() && ret;
+    refreshQueryLangSupported();
+    return g_queryLangSupportedCache;
 }
 
 #ifdef VECTOR_SEARCH
 bool IntelligentRetrievalWidget::isVectorSupported()
 {
-    auto msg = createVectorMsg("Enable");
-    QDBusPendingReply<bool> ret = QDBusConnection::sessionBus().asyncCall(msg, 500);
-    ret.waitForFinished();
-    return ret.isValid() && ret;
+    refreshVectorSupported();
+    return g_vectorSupportedCache;
 }
 #endif
 
@@ -374,19 +480,8 @@ void IntelligentRetrievalWidget::setAutoIndex(bool on)
 
 QVariantHash IntelligentRetrievalWidget::getIndexStatus()
 {
-    auto msg = createQueryLangMsg("GetSemanticStatus");
-    QDBusPendingReply<QString> ret = QDBusConnection::sessionBus().asyncCall(msg, 500);
-
-    ret.waitForFinished();
-    if (ret.error().type() != QDBusError::NoError) {
-        qCWarning(logGrandSearch) << "Failed to get semantic status - Service:" << msg.service()
-                                  << "Error:" << QDBusError::errorString(ret.error().type())
-                                  << "Response:" << ret;
-        return QVariantHash();
-    }
-
-    QString json = ret;
-    return QJsonDocument::fromJson(json.toUtf8()).object().toVariantHash();
+    refreshSemanticStatus();
+    return g_semanticStatusCache;
 }
 
 bool IntelligentRetrievalWidget::isUpdateIndex()
@@ -443,34 +538,13 @@ void IntelligentRetrievalWidget::setAutoIndex(bool on)
     list.append(on);
     msg.setArguments(list);
 
-    QDBusPendingReply<void> ret = QDBusConnection::sessionBus().asyncCall(msg, 500);
-    ret.waitForFinished();
-    if (ret.error().type() != QDBusError::NoError) {
-        qCWarning(logGrandSearch) << "Failed to set auto index - Service:" << msg.service()
-                                  << "Error:" << QDBusError::errorString(ret.error().type());
-    }
-    return;
+    QDBusConnection::sessionBus().asyncCall(msg, 500);
 }
 
 bool IntelligentRetrievalWidget::getIndexStatus(QVariantHash &statuts)
 {
-    auto msg = createVectorMsg("getAutoIndexStatus");
-    QVariantList list;
-    list.append(QString(INER_APP_NAME));
-    msg.setArguments(list);
-
-    QDBusPendingReply<QString> ret = QDBusConnection::sessionBus().asyncCall(msg, 500);
-    ret.waitForFinished();
-
-    if (ret.error().type() != QDBusError::NoError) {
-        qCWarning(logGrandSearch) << "Failed to get index status - Service:" << msg.service()
-                                  << "Error:" << QDBusError::errorString(ret.error().type())
-                                  << "Response:" << ret;
-        return false;
-    }
-
-    QString json = ret;
-    statuts = QJsonDocument::fromJson(json.toUtf8()).object().toVariantHash();
+    refreshVectorStatus();
+    statuts = g_vectorStatusCache;
     return statuts.value("enable", false).toBool();
 }
 #endif

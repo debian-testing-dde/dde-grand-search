@@ -1,3 +1,9 @@
+dde-grand-search (6.0.30+debtest1) unstable; urgency=medium
+
+  * fix: avoid blocking AI settings UI on D-Bus and package status checks
+
+ -- Hao <hao@debian-testing-dde.local>  Tue, 10 Mar 2026 20:45:00 +0800
+
 dde-grand-search (6.0.30) unstable; urgency=medium
 
   * fix: grand search quick panel don't show tooltip

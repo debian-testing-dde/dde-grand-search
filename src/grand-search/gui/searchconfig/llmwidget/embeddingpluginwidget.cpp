@@ -26,6 +26,16 @@ EmbeddingPluginWidget::EmbeddingPluginWidget(QWidget *parent)
     : DWidget(parent)
 {
     initUI();
+
+    m_statusProcess = new QProcess(this);
+    connect(m_statusProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int, QProcess::ExitStatus) {
+        const QByteArray reply = m_statusProcess->readAllStandardOutput();
+        updateInstallStatus(reply == "'installed\n'");
+    });
+    connect(m_statusProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        qCWarning(logGrandSearch) << "Failed to query embedding plugin install status - Error:" << error;
+        updateInstallStatus(false);
+    });
 }
 
 void EmbeddingPluginWidget::setText(const QString &theme, const QString &summary)
@@ -41,16 +51,17 @@ bool EmbeddingPluginWidget::isInstalled()
 
 void EmbeddingPluginWidget::checkInstallStatus()
 {
-    QProcess m_pProcess;
-    m_pProcess.start("dpkg-query", QStringList() << "-W" << QString("-f='${db:Status-Status}\n'") << PLUGINSNAME);
-    m_pProcess.waitForFinished();
-    QByteArray reply = m_pProcess.readAllStandardOutput();
-    bool installStatus = (reply == "'installed\n'" ? true : false);
+    if (!m_statusProcess || m_statusProcess->state() != QProcess::NotRunning)
+        return;
+
+    m_statusProcess->start("dpkg-query", QStringList() << "-W" << QString("-f='${db:Status-Status}\n'") << PLUGINSNAME);
+}
+
+void EmbeddingPluginWidget::updateInstallStatus(bool installStatus)
+{
     m_pManageModel->setProperty("modelStatus", installStatus ? Install : Uninstall);
     m_pManageModel->setVisible(!installStatus);
-
     m_pLabelStatus->setText(installStatus ? tr("Installed") : tr("Not Installed"));
-
     emit pluginStateChanged(installStatus);
 }
 
